@@ -16,6 +16,7 @@ import (
 func main() {
 	projectID := flag.String("project", "", "Google Cloud Project ID")
 	datasetID := flag.String("dataset", "", "BigQuery Dataset ID")
+	sampleRate := flag.Float64("sample_rate", 0.01, "Sample rate for downloading data")
 	flag.Parse()
 
 	if *projectID == "" || *datasetID == "" {
@@ -48,7 +49,7 @@ func main() {
 	}
 
 	for _, table := range tables {
-		if err := downloadTableData(ctx, client, *datasetID, table, db); err != nil {
+		if err := downloadTableData(ctx, client, *datasetID, table, db, sampleRate); err != nil {
 			log.Printf("Failed to download data for table %s: %v", table, err)
 		}
 	}
@@ -71,7 +72,7 @@ func listTables(ctx context.Context, client *bigquery.Client, datasetID string) 
 	return tables, nil
 }
 
-func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, tableID string, db *sql.DB) error {
+func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, tableID string, db *sql.DB, sampleRate *float64) error {
 	rowCount, err := countRows(ctx, client, datasetID, tableID)
 	if err != nil {
 		return err
@@ -83,7 +84,7 @@ func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, 
 	fmt.Printf("Table %s has %d rows\n", tableID, rowCount)
 
 	// Calculate 1% of the number of rows, rounded up to the nearest integer
-	sampleSize := int(math.Ceil(float64(rowCount) * 0.01))
+	sampleSize := int(math.Ceil(float64(rowCount) * *sampleRate))
 
 	fmt.Printf("Downloading %d rows for table %s\n", sampleSize, tableID)
 	query := fmt.Sprintf("SELECT message FROM `%s.%s.%s` LIMIT %d", client.Project(), datasetID, tableID, sampleSize)
@@ -94,6 +95,8 @@ func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, 
 	}
 
 	fmt.Println("Saving data to DuckDB")
+	var batch []string
+	var count int
 	for {
 		var values []bigquery.Value
 		err := it.Next(&values)
@@ -105,7 +108,24 @@ func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, 
 		}
 
 		message := fmt.Sprintf("%v", values)
-		if err := saveToDuckDB(db, tableID, message); err != nil {
+		batch = append(batch, message)
+
+		if len(batch) >= 1000 {
+			// Print the number of records saved. This line will be overwritten by the next batch
+			count += len(batch)
+			fmt.Printf("\rSaved %d records", count)
+			if err := saveBatchToDuckDB(db, tableID, batch); err != nil {
+				return err
+			}
+			batch = batch[:0] // Reset the batch
+		}
+	}
+
+	// Save any remaining records
+	if len(batch) > 0 {
+		count += len(batch)
+		fmt.Printf("\rSaved %d records", count)
+		if err := saveBatchToDuckDB(db, tableID, batch); err != nil {
 			return err
 		}
 	}
@@ -145,4 +165,24 @@ func countRows(ctx context.Context, client *bigquery.Client, datasetID string, t
 func saveToDuckDB(db *sql.DB, tableName, message string) error {
 	_, err := db.Exec("INSERT INTO results (table_name, message) VALUES (?, ?)", tableName, message)
 	return err
+}
+
+func saveBatchToDuckDB(db *sql.DB, tableName string, batch []string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare("INSERT INTO results (table_name, message) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, message := range batch {
+		if _, err := stmt.Exec(tableName, message); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
