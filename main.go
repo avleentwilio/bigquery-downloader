@@ -161,7 +161,6 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
         WHERE creation_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY) 
         AND CURRENT_TIMESTAMP()
         AND job_type = "QUERY"
-        AND end_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY) AND CURRENT_TIMESTAMP()
         ORDER BY total_bytes_processed DESC
     `
 	q := client.Query(query)
