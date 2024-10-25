@@ -1,3 +1,5 @@
 /bigquery-downloader
 /results.duckdb
 /results.duckdb.wal
+results.duckdb.bak
+.vscode/
