@@ -158,8 +158,7 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
             query,
             referenced_tables
         FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-        WHERE creation_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY) 
-        AND CURRENT_TIMESTAMP()
+        WHERE creation_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY) AND CURRENT_TIMESTAMP()
         AND job_type = "QUERY"
         ORDER BY total_bytes_processed DESC
     `
@@ -203,7 +202,7 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 		values[3] = tableRefsString
 		batch = append(batch, values)
 
-		if len(batch) >= 1 {
+		if len(batch) >= 1000 {
 			if err := saveQueryBatchToDuckDB(db, batch); err != nil {
 				return err
 			}
