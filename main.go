@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
+	"strings"
 
 	"cloud.google.com/go/bigquery"
+	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
+	resourcemanagerpb "cloud.google.com/go/resourcemanager/apiv3/resourcemanagerpb"
 	_ "github.com/marcboeker/go-duckdb"
 	"google.golang.org/api/iterator"
 )
@@ -30,11 +34,6 @@ func main() {
 	}
 
 	ctx := context.Background()
-	fmt.Println("Connecting to BigQuery")
-	client, err := bigquery.NewClient(ctx, *projectID)
-	if err != nil {
-		log.Fatalf("Failed to create BigQuery client: %v", err)
-	}
 
 	// Initialize DuckDB connection
 	db, err := sql.Open("duckdb", "results.duckdb")
@@ -48,13 +47,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create table samples in DuckDB: %v", err)
 	}
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS queries (user_email TEXT, total_bytes_processed BIGINT, query TEXT, referenced_tables STRUCT(project_id TEXT, dataset_id TEXT, tables TEXT)[])")
+	// Create a sequence to generate unique IDs for each row
+	_, err = db.Exec("CREATE SEQUENCE IF NOT EXISTS queries_id_seq START 1")
+	if err != nil {
+		log.Fatalf("Failed to create sequence queries_id_seq in DuckDB: %v", err)
+	}
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS queries (id INTEGER DEFAULT nextval('queries_id_seq'), creation_time TIMESTAMP, user_email TEXT, total_bytes_processed BIGINT, query TEXT, referenced_tables STRUCT(project_id TEXT, dataset_id TEXT, tables TEXT)[])")
 	if err != nil {
 		log.Fatalf("Failed to create table queries in DuckDB: %v", err)
 	}
 
 	switch *mode {
 	case "table_samples":
+		fmt.Println("Connecting to BigQuery")
+		client, err := bigquery.NewClient(ctx, *projectID)
+		if err != nil {
+			log.Fatalf("Failed to create BigQuery client: %v", err)
+		}
+
 		tables, err := listTables(ctx, client, *datasetID)
 		if err != nil {
 			log.Fatalf("Failed to list tables: %v", err)
@@ -66,10 +76,62 @@ func main() {
 			}
 		}
 	case "query_list":
-		if err := downloadQueryList(ctx, client, db); err != nil {
-			log.Fatalf("Failed to download query list: %v", err)
+		// If the project flag is not set, download the query list for all projects. Otherwise, only download the query list for the specified project.
+		var projects []string
+		if *projectID != "" {
+			projects = []string{*projectID}
+		} else {
+			// Get a list of all BigQuery projects
+			projectList, err := listProjects(ctx)
+			if err != nil {
+				log.Fatalf("Failed to list projects: %v", err)
+			}
+			projects = projectList
+		}
+		// Iterate over each project and download the query list
+
+		for _, project := range projects {
+			fmt.Println("Connecting to BigQuery project: ", project)
+			client, err := bigquery.NewClient(ctx, project)
+			if err != nil {
+				log.Fatalf("Failed to create BigQuery client: %v", err)
+			}
+			if err := downloadQueryList(ctx, client, db); err != nil {
+				log.Printf("Failed to download query list: %v", err)
+			}
 		}
 	}
+}
+
+func listProjects(ctx context.Context) ([]string, error) {
+	fmt.Println("Listing projects")
+	var projects []string
+	client, err := resourcemanager.NewProjectsClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+
+	// Specify the parent resource name
+	parent := "folders/359975919687" // Replace with your organization ID or folder ID
+
+	req := &resourcemanagerpb.ListProjectsRequest{
+		Parent: parent,
+	}
+	it := client.ListProjects(ctx, req)
+	for {
+		project, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		projects = append(projects, project.ProjectId)
+	}
+	// Sort the projects
+	sort.Strings(projects)
+	return projects, nil
 }
 
 func listTables(ctx context.Context, client *bigquery.Client, datasetID string) ([]string, error) {
@@ -153,12 +215,13 @@ func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, 
 func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB) error {
 	query := `
         SELECT
+			creation_time,
             user_email,
             total_bytes_processed,
             query,
             referenced_tables
         FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-        WHERE creation_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY) AND CURRENT_TIMESTAMP()
+        WHERE creation_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 360 DAY) AND CURRENT_TIMESTAMP()
         AND job_type = "QUERY"
         ORDER BY total_bytes_processed DESC
     `
@@ -182,11 +245,11 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 			return err
 		}
 		// Convert the referenced tables to a slice of maps
-		for i := 0; i < len(values[3].([]bigquery.Value)); i += 1 {
+		for i := 0; i < len(values[4].([]bigquery.Value)); i += 1 {
 			tableRefs = append(tableRefs, map[string]string{
-				"project_id": values[3].([]bigquery.Value)[i].([]bigquery.Value)[0].(string),
-				"dataset_id": values[3].([]bigquery.Value)[i].([]bigquery.Value)[1].(string),
-				"tables":     values[3].([]bigquery.Value)[i].([]bigquery.Value)[2].(string),
+				"project_id": values[4].([]bigquery.Value)[i].([]bigquery.Value)[0].(string),
+				"dataset_id": values[4].([]bigquery.Value)[i].([]bigquery.Value)[1].(string),
+				"tables":     values[4].([]bigquery.Value)[i].([]bigquery.Value)[2].(string),
 			})
 		}
 		// Serialize the referenced tables to a JSON string
@@ -199,7 +262,10 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 			// Skip this record
 			continue
 		}
-		values[3] = tableRefsString
+		values[4] = tableRefsString
+
+		// Replace the \n in the query with a space
+		values[3] = strings.Replace(values[3].(string), "\n", " ", -1)
 		batch = append(batch, values)
 
 		if len(batch) >= 1000 {
@@ -279,14 +345,14 @@ func saveQueryBatchToDuckDB(db *sql.DB, batch [][]bigquery.Value) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare("INSERT INTO queries (user_email, total_bytes_processed, query, referenced_tables) VALUES (?, ?, ?, ?)")
+	stmt, err := tx.Prepare("INSERT INTO queries (creation_time, user_email, total_bytes_processed, query, referenced_tables) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, row := range batch {
-		if _, err := stmt.Exec(row[0], row[1], row[2], row[3]); err != nil {
+		if _, err := stmt.Exec(row[0], row[1], row[2], row[3], row[4]); err != nil {
 			return err
 		}
 	}
