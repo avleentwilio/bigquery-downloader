@@ -10,6 +10,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/bigquery"
 	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
@@ -19,21 +20,49 @@ import (
 )
 
 func main() {
-	projectID := flag.String("project", "", "Google Cloud Project ID")
+	var modes []string
+	validModes := map[string]bool{
+		"table_ingest":  true,
+		"table_samples": true,
+		"table_sizes":   true,
+		"query_list":    true,
+	}
+	for mode := range validModes {
+		modes = append(modes, mode)
+	}
+
+	projectID := flag.String("project", "", "Comma separated list of Google Cloud Project IDs")
 	datasetID := flag.String("dataset", "", "BigQuery Dataset ID")
 	sampleRate := flag.Float64("sample_rate", 0.01, "Sample rate for downloading data")
-	mode := flag.String("mode", "", "Mode of operation: table_samples, query_list")
+	mode := flag.String("mode", "", "Mode of operation: "+strings.Join(modes, ", "))
+	concurrency := flag.Int("concurrency", 10, "Number of concurrent requests")
 	flag.Parse()
 
 	if *mode == "table_samples" && (*projectID == "" || *datasetID == "") {
 		log.Fatalf("Both project and dataset flags are required when mode=table_samples")
 	}
 
-	if mode == nil || (*mode != "table_samples" && *mode != "query_list") {
-		log.Fatalf("Invalid mode. Must be one of: table_samples, query_list")
+	// mode should be in the list of validModes
+	if !validModes[*mode] {
+		log.Fatalf("Invalid mode: %s. Valid modes are: table_ingest, table_samples, table_sizes, query_list", *mode)
 	}
 
 	ctx := context.Background()
+
+	// Store the project ID in a slice
+	var projects []string
+	if *projectID != "" {
+		projects = append(projects, strings.Split(*projectID, ",")...)
+	} else {
+		// Get a list of all BigQuery projects
+		fmt.Println("Getting a list of all Quantico projects in GCP")
+		projectList, err := listProjects(ctx)
+		if err != nil {
+			log.Fatalf("Failed to list projects: %v", err)
+		}
+		projects = append(projects, projectList...)
+
+	}
 
 	// Initialize DuckDB connection
 	db, err := sql.Open("duckdb", "results.duckdb")
@@ -56,6 +85,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create table queries in DuckDB: %v", err)
 	}
+	// Create a table to store the size of each table in each dataset in each project
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS table_sizes (project_id TEXT, table_name TEXT, active_logical_bytes BIGINT, long_term_logical_bytes BIGINT, active_physical_bytes BIGINT, long_term_physical_bytes BIGINT, time_travel_physical_bytes BIGINT, fail_safe_physical_bytes BIGINT)")
+	if err != nil {
+		log.Fatalf("Failed to create table table_sizes in DuckDB: %v", err)
+	}
+	// Create a table to store the amount of data ingested into each table in each dataset in each project by month
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS table_ingestion (project_id TEXT, dataset_id TEXT, table_id TEXT, month DATE, bytes_ingested BIGINT)")
+	if err != nil {
+		log.Fatalf("Failed to create table table_ingestion in DuckDB: %v", err)
+	}
 
 	switch *mode {
 	case "table_samples":
@@ -71,25 +110,12 @@ func main() {
 		}
 
 		for _, table := range tables {
-			if err := downloadTableData(ctx, client, *datasetID, table, db, sampleRate); err != nil {
+			if err := downloadTableRows(ctx, client, *datasetID, table, db, sampleRate); err != nil {
 				log.Printf("Failed to download data for table %s: %v", table, err)
 			}
 		}
 	case "query_list":
-		// If the project flag is not set, download the query list for all projects. Otherwise, only download the query list for the specified project.
-		var projects []string
-		if *projectID != "" {
-			projects = []string{*projectID}
-		} else {
-			// Get a list of all BigQuery projects
-			projectList, err := listProjects(ctx)
-			if err != nil {
-				log.Fatalf("Failed to list projects: %v", err)
-			}
-			projects = projectList
-		}
 		// Iterate over each project and download the query list
-
 		for _, project := range projects {
 			fmt.Println("Connecting to BigQuery project: ", project)
 			client, err := bigquery.NewClient(ctx, project)
@@ -100,6 +126,58 @@ func main() {
 				log.Printf("Failed to download query list: %v", err)
 			}
 		}
+	case "table_sizes":
+		// Create a buffered channel to limit concurrency to 10
+		sem := make(chan struct{}, *concurrency)
+		var wg sync.WaitGroup
+
+		// Iterate over each project and download the current table sizes concurrently
+		for _, project := range projects {
+			wg.Add(1)
+			go func(project string) {
+				defer wg.Done()
+				sem <- struct{}{}        // Acquire a token
+				defer func() { <-sem }() // Release the token
+
+				fmt.Println("Connecting to BigQuery project: ", project)
+				client, err := bigquery.NewClient(ctx, project)
+				if err != nil {
+					log.Fatalf("Failed to create BigQuery client: %v", err)
+				}
+				if err := downloadTableSizes(ctx, client, db); err != nil {
+					log.Printf("Failed to download table size for %s: %v", project, err)
+				}
+			}(project)
+		}
+
+		// Wait for all goroutines to complete
+		wg.Wait()
+	case "table_ingest":
+		// Create a buffered channel to limit concurrency to 10
+		sem := make(chan struct{}, *concurrency)
+		var wg sync.WaitGroup
+
+		// Iterate over each project and download the amount of data ingested into each table by month concurrently
+		for _, project := range projects {
+			wg.Add(1)
+			go func(project string) {
+				defer wg.Done()
+				sem <- struct{}{}        // Acquire a token
+				defer func() { <-sem }() // Release the token
+
+				fmt.Println("Connecting to BigQuery project: ", project)
+				client, err := bigquery.NewClient(ctx, project)
+				if err != nil {
+					log.Fatalf("Failed to create BigQuery client: %v", err)
+				}
+				if err := downloadTableIngestion(ctx, client, db); err != nil {
+					log.Printf("Failed to download table ingestion data: %v", err)
+				}
+			}(project)
+		}
+
+		// Wait for all goroutines to complete
+		wg.Wait()
 	}
 }
 
@@ -134,6 +212,23 @@ func listProjects(ctx context.Context) ([]string, error) {
 	return projects, nil
 }
 
+func listDatasets(ctx context.Context, client *bigquery.Client) ([]string, error) {
+	fmt.Println("Listing datasets in project")
+	var datasets []string
+	it := client.Datasets(ctx)
+	for {
+		dataset, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		datasets = append(datasets, dataset.DatasetID)
+	}
+	return datasets, nil
+}
+
 func listTables(ctx context.Context, client *bigquery.Client, datasetID string) ([]string, error) {
 	fmt.Println("Listing tables in dataset")
 	var tables []string
@@ -151,7 +246,115 @@ func listTables(ctx context.Context, client *bigquery.Client, datasetID string) 
 	return tables, nil
 }
 
-func downloadTableData(ctx context.Context, client *bigquery.Client, datasetID, tableID string, db *sql.DB, sampleRate *float64) error {
+func downloadTableSizes(ctx context.Context, client *bigquery.Client, db *sql.DB) error {
+	fmt.Println("Downloading table sizes")
+	query := `
+		SELECT 
+			project_id,
+			table_name,
+			sum(active_logical_bytes) as active_logical_bytes,
+			sum(long_term_logical_bytes) as long_term_logical_bytes,
+			sum(active_physical_bytes) as active_physical_bytes,
+			sum(long_term_physical_bytes) as long_term_physical_bytes,
+			sum(time_travel_physical_bytes) as time_travel_physical_bytes,
+			sum(fail_safe_physical_bytes) as fail_safe_physical_bytes
+		FROM 
+			region-us.INFORMATION_SCHEMA.TABLE_STORAGE
+		WHERE total_logical_bytes > 0
+		AND table_schema != 'expired_tables'
+		GROUP BY project_id, table_name
+	`
+	q := client.Query(query)
+
+	it, err := q.Read(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Saving table sizes to DuckDB")
+	batch := make([][]bigquery.Value, 0, 1000)
+	for {
+		var values []bigquery.Value
+		err := it.Next(&values)
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		batch = append(batch, values)
+
+		if len(batch) >= 1000 {
+			if err := saveTableSizesBatchToDuckDB(db, batch); err != nil {
+				return err
+			}
+			batch = batch[:0] // Reset the batch
+		}
+	}
+
+	// Save any remaining records
+	if len(batch) > 0 {
+		if err := saveTableSizesBatchToDuckDB(db, batch); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func downloadTableIngestion(ctx context.Context, client *bigquery.Client, db *sql.DB) error {
+	fmt.Println("Downloading table ingestion data")
+	query := `
+		SELECT
+			project_id,
+			dataset_id,
+			table_id,
+			DATE_TRUNC(creation_time, MONTH) AS month,
+			SUM(total_bytes_processed) AS bytes_ingested
+		FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+		WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 YEAR)
+		AND job_type = "QUERY"
+		GROUP BY project_id, dataset_id, table_id, month
+	`
+	q := client.Query(query)
+
+	it, err := q.Read(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Saving table ingestion data to DuckDB")
+	batch := make([][]bigquery.Value, 0, 1000)
+	for {
+		var values []bigquery.Value
+		err := it.Next(&values)
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		batch = append(batch, values)
+
+		if len(batch) >= 1000 {
+			if err := saveTableIngestionBatchToDuckDB(db, batch); err != nil {
+				return err
+			}
+			batch = batch[:0] // Reset the batch
+		}
+	}
+
+	// Save any remaining records
+	if len(batch) > 0 {
+		if err := saveTableIngestionBatchToDuckDB(db, batch); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func downloadTableRows(ctx context.Context, client *bigquery.Client, datasetID, tableID string, db *sql.DB, sampleRate *float64) error {
 	rowCount, err := countRows(ctx, client, datasetID, tableID)
 	if err != nil {
 		return err
@@ -346,6 +549,46 @@ func saveQueryBatchToDuckDB(db *sql.DB, batch [][]bigquery.Value) error {
 		return err
 	}
 	stmt, err := tx.Prepare("INSERT INTO queries (creation_time, user_email, total_bytes_processed, query, referenced_tables) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, row := range batch {
+		if _, err := stmt.Exec(row[0], row[1], row[2], row[3], row[4]); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func saveTableSizesBatchToDuckDB(db *sql.DB, batch [][]bigquery.Value) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare("INSERT INTO table_sizes (project_id, table_name, active_logical_bytes, long_term_logical_bytes, active_physical_bytes, long_term_physical_bytes, time_travel_physical_bytes, fail_safe_physical_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, row := range batch {
+		if _, err := stmt.Exec(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func saveTableIngestionBatchToDuckDB(db *sql.DB, batch [][]bigquery.Value) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare("INSERT INTO table_ingestion (project_id, dataset_id, table_id, month, bytes_ingested) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
