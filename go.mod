@@ -4,12 +4,13 @@ go 1.23.2
 
 require (
 	cloud.google.com/go/bigquery v1.64.0
+	cloud.google.com/go/resourcemanager v1.10.2
+	github.com/mattn/go-sqlite3 v1.14.24
 	google.golang.org/api v0.203.0
 )
 
 require (
 	cloud.google.com/go/longrunning v0.6.2 // indirect
-	cloud.google.com/go/resourcemanager v1.10.2 // indirect
 	github.com/apache/arrow/go/v17 v17.0.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 )
