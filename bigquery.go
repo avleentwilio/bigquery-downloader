@@ -140,13 +140,13 @@ func downloadTableIngestion(ctx context.Context, client *bigquery.Client, db *sq
 	fmt.Println("Downloading table ingestion data")
 	query := `
 		SELECT
-			project_id,
-			dataset_id,
-			table_id,
+			destination_table.project_id as project_id,
+			destination_table.dataset_id as dataset_id,
+			destination_table.table_id as table_id,
 			DATE_TRUNC(creation_time, MONTH) AS month,
 			SUM(total_bytes_processed) AS bytes_ingested
 		FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-		WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 YEAR)
+		WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
 		AND job_type = "QUERY"
 		GROUP BY project_id, dataset_id, table_id, month
 	`
@@ -254,6 +254,7 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
         SELECT
 			creation_time,
             user_email,
+            total_bytes_billed,
             total_bytes_processed,
             query,
             referenced_tables
@@ -282,11 +283,11 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 			return err
 		}
 		// Convert the referenced tables to a slice of maps
-		for i := 0; i < len(values[4].([]bigquery.Value)); i += 1 {
+		for i := 0; i < len(values[5].([]bigquery.Value)); i += 1 {
 			tableRefs = append(tableRefs, map[string]string{
-				"project_id": values[4].([]bigquery.Value)[i].([]bigquery.Value)[0].(string),
-				"dataset_id": values[4].([]bigquery.Value)[i].([]bigquery.Value)[1].(string),
-				"tables":     values[4].([]bigquery.Value)[i].([]bigquery.Value)[2].(string),
+				"project_id": values[5].([]bigquery.Value)[i].([]bigquery.Value)[0].(string),
+				"dataset_id": values[5].([]bigquery.Value)[i].([]bigquery.Value)[1].(string),
+				"tables":     values[5].([]bigquery.Value)[i].([]bigquery.Value)[2].(string),
 			})
 		}
 		// Serialize the referenced tables to a JSON string
@@ -299,10 +300,10 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 			// Skip this record
 			continue
 		}
-		values[4] = tableRefsString
+		values[5] = tableRefsString
 
 		// Replace the \n in the query with a space
-		values[3] = strings.Replace(values[3].(string), "\n", " ", -1)
+		values[4] = strings.Replace(values[4].(string), "\n", " ", -1)
 		batch = append(batch, values)
 
 		if len(batch) >= 1000 {
