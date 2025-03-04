@@ -83,21 +83,21 @@ func listTables(ctx context.Context, client *bigquery.Client, datasetID string) 
 func downloadTableSizes(ctx context.Context, client *bigquery.Client, db *sql.DB) error {
 	fmt.Println("Downloading table sizes")
 	query := `
-		SELECT
-			project_id,
-			table_name,
-			sum(active_logical_bytes) as active_logical_bytes,
-			sum(long_term_logical_bytes) as long_term_logical_bytes,
-			sum(active_physical_bytes) as active_physical_bytes,
-			sum(long_term_physical_bytes) as long_term_physical_bytes,
-			sum(time_travel_physical_bytes) as time_travel_physical_bytes,
-			sum(fail_safe_physical_bytes) as fail_safe_physical_bytes
-		FROM
-			region-us.INFORMATION_SCHEMA.TABLE_STORAGE
-		WHERE total_logical_bytes > 0
-		AND table_schema != 'expired_tables'
-		GROUP BY project_id, table_name
-	`
+                SELECT
+                        project_id,
+                        table_name,
+                        sum(active_logical_bytes) as active_logical_bytes,
+                        sum(long_term_logical_bytes) as long_term_logical_bytes,
+                        sum(active_physical_bytes) as active_physical_bytes,
+                        sum(long_term_physical_bytes) as long_term_physical_bytes,
+                        sum(time_travel_physical_bytes) as time_travel_physical_bytes,
+                        sum(fail_safe_physical_bytes) as fail_safe_physical_bytes
+                FROM
+                        region-us.INFORMATION_SCHEMA.TABLE_STORAGE
+                WHERE total_logical_bytes > 0
+                AND table_schema != 'expired_tables'
+                GROUP BY project_id, table_name
+        `
 	q := client.Query(query)
 
 	it, err := q.Read(ctx)
@@ -139,17 +139,17 @@ func downloadTableSizes(ctx context.Context, client *bigquery.Client, db *sql.DB
 func downloadTableIngestion(ctx context.Context, client *bigquery.Client, db *sql.DB) error {
 	fmt.Println("Downloading table ingestion data")
 	query := `
-		SELECT
-			destination_table.project_id as project_id,
-			destination_table.dataset_id as dataset_id,
-			destination_table.table_id as table_id,
-			DATE_TRUNC(creation_time, MONTH) AS month,
-			SUM(total_bytes_processed) AS bytes_ingested
-		FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-		WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
-		AND job_type = "QUERY"
-		GROUP BY project_id, dataset_id, table_id, month
-	`
+                SELECT
+                        destination_table.project_id as project_id,
+                        destination_table.dataset_id as dataset_id,
+                        destination_table.table_id as table_id,
+                        DATE_TRUNC(creation_time, MONTH) AS month,
+                        SUM(total_bytes_processed) AS bytes_ingested
+                FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+                WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
+                AND job_type = "QUERY"
+                GROUP BY project_id, dataset_id, table_id, month
+        `
 	q := client.Query(query)
 
 	it, err := q.Read(ctx)
@@ -252,7 +252,8 @@ func downloadTableRows(ctx context.Context, client *bigquery.Client, datasetID, 
 func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB) error {
 	query := `
         SELECT
-			creation_time,
+            creation_time,
+            end_time,
             user_email,
             total_bytes_billed,
             total_bytes_processed,
@@ -283,11 +284,11 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 			return err
 		}
 		// Convert the referenced tables to a slice of maps
-		for i := 0; i < len(values[5].([]bigquery.Value)); i += 1 {
+		for i := 0; i < len(values[6].([]bigquery.Value)); i += 1 {
 			tableRefs = append(tableRefs, map[string]string{
-				"project_id": values[5].([]bigquery.Value)[i].([]bigquery.Value)[0].(string),
-				"dataset_id": values[5].([]bigquery.Value)[i].([]bigquery.Value)[1].(string),
-				"tables":     values[5].([]bigquery.Value)[i].([]bigquery.Value)[2].(string),
+				"project_id": values[6].([]bigquery.Value)[i].([]bigquery.Value)[0].(string),
+				"dataset_id": values[6].([]bigquery.Value)[i].([]bigquery.Value)[1].(string),
+				"tables":     values[6].([]bigquery.Value)[i].([]bigquery.Value)[2].(string),
 			})
 		}
 		// Serialize the referenced tables to a JSON string
@@ -300,10 +301,10 @@ func downloadQueryList(ctx context.Context, client *bigquery.Client, db *sql.DB)
 			// Skip this record
 			continue
 		}
-		values[5] = tableRefsString
+		values[6] = tableRefsString
 
 		// Replace the \n in the query with a space
-		values[4] = strings.Replace(values[4].(string), "\n", " ", -1)
+		values[5] = strings.Replace(values[5].(string), "\n", " ", -1)
 		batch = append(batch, values)
 
 		if len(batch) >= 1000 {

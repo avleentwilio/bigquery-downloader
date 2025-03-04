@@ -33,14 +33,14 @@ func saveQueryBatchToDuckDB(db *sql.DB, batch [][]bigquery.Value) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare("INSERT INTO queries (creation_time, user_email, total_bytes_processed, total_bytes_billed, query, referenced_tables) VALUES (?, ?, ?, ?, ?, ?)")
+	stmt, err := tx.Prepare("INSERT INTO queries (creation_time, end_time, user_email, total_bytes_processed, total_bytes_billed, query, referenced_tables) VALUES (?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, row := range batch {
-		if _, err := stmt.Exec(row[0], row[1], row[2], row[3], row[4], row[5]); err != nil {
+		if _, err := stmt.Exec(row[0], row[1], row[2], row[3], row[4], row[5], row[6]); err != nil {
 			return err
 		}
 	}
@@ -126,7 +126,7 @@ func initializeDuckDB(db *sql.DB) {
 	if err != nil {
 		log.Fatalf("Failed to create sequence queries_id_seq in DuckDB: %v", err)
 	}
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS queries (id INTEGER DEFAULT nextval('queries_id_seq'), creation_time TIMESTAMP, user_email TEXT, total_bytes_processed BIGINT, total_bytes_billed BIGINT, query TEXT, referenced_tables STRUCT(project_id TEXT, dataset_id TEXT, tables TEXT)[])")
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS queries (id INTEGER DEFAULT nextval('queries_id_seq'), creation_time TIMESTAMP, end_time TIMESTAMP, user_email TEXT, total_bytes_processed BIGINT, total_bytes_billed BIGINT, query TEXT, referenced_tables STRUCT(project_id TEXT, dataset_id TEXT, tables TEXT)[])")
 	if err != nil {
 		log.Fatalf("Failed to create table queries in DuckDB: %v", err)
 	}
